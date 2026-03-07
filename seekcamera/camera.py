@@ -357,6 +357,7 @@ class SeekCameraPipelineMode(IntEnum):
     LITE = 0
     LEGACY = 1
     SEEKVISION = 2
+    EAGLE = 3
 
     def __str__(self):
         return self.name

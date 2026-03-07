@@ -15,9 +15,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from threading import Condition
+import logging
+import os
+import signal
+import sys
+from threading import Condition, Thread, Event
 
 import cv2
+import numpy as np
+
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "viewer.log")
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH, mode="w"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("viewer")
 
 from seekcamera import (
     SeekCameraIOType,
@@ -25,6 +41,11 @@ from seekcamera import (
     SeekCameraManager,
     SeekCameraManagerEvent,
     SeekCameraFrameFormat,
+    SeekCameraAGCMode,
+    SeekCameraFilter,
+    SeekCameraFilterState,
+    SeekCameraFlatSceneCorrectionID,
+    SeekCameraPipelineMode,
     SeekCamera,
     SeekFrame,
 )
@@ -61,6 +82,7 @@ def on_frame(_camera, camera_frame, renderer):
     # all rendering done by OpenCV needs to happen on the main thread.
     with renderer.frame_condition:
         renderer.frame = camera_frame.color_argb8888
+        renderer.frame_count = getattr(renderer, 'frame_count', 0) + 1
         renderer.frame_condition.notify()
 
 
@@ -80,7 +102,7 @@ def on_event(camera, event_type, event_status, renderer):
         User defined data passed to the callback. This can be anything
         but in this case it is a reference to the Renderer object.
     """
-    print("{}: {}".format(str(event_type), camera.chipid))
+    log.info("{}: {}".format(str(event_type), camera.chipid))
 
     if event_type == SeekCameraManagerEvent.CONNECT:
         if renderer.busy:
@@ -95,14 +117,20 @@ def on_event(camera, event_type, event_status, renderer):
         # This is required to properly resize the rendering window.
         renderer.first_frame = True
 
-        # Set a custom color palette.
-        # Other options can set in a similar fashion.
+        # Configure Eagle pipeline mode BEFORE starting capture.
+        try:
+            camera.pipeline_mode = SeekCameraPipelineMode.EAGLE
+            log.info("Pipeline mode set to EAGLE")
+        except Exception as e:
+            log.info("Failed to set EAGLE pipeline mode: {}".format(e))
+
+        # Set color palette before capture.
         camera.color_palette = SeekCameraColorPalette.TYRIAN
 
-        # Start imaging and provide a custom callback to be called
-        # every time a new frame is received.
+        # Start imaging.
         camera.register_frame_available_callback(on_frame, renderer)
         camera.capture_session_start(SeekCameraFrameFormat.COLOR_ARGB8888)
+        log.info("Capture session started")
 
     elif event_type == SeekCameraManagerEvent.DISCONNECT:
         # Check that the camera disconnecting is one actually associated with
@@ -115,7 +143,7 @@ def on_event(camera, event_type, event_status, renderer):
             renderer.busy = False
 
     elif event_type == SeekCameraManagerEvent.ERROR:
-        print("{}: {}".format(str(event_status), camera.chipid))
+        log.info("{}: {}".format(str(event_status), camera.chipid))
 
     elif event_type == SeekCameraManagerEvent.READY_TO_PAIR:
         return
@@ -125,41 +153,93 @@ def main():
     window_name = "Seek Thermal - Python OpenCV Sample"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-    # Create a context structure responsible for managing all connected USB cameras.
-    # Cameras with other IO types can be managed by using a bitwise or of the
-    # SeekCameraIOType enum cases.
-    with SeekCameraManager(SeekCameraIOType.USB) as manager:
-        # Start listening for events.
-        renderer = Renderer()
-        manager.register_event_callback(on_event, renderer)
+    keep_running = True
+    shutdown_event = Event()
 
-        while True:
-            # Wait a maximum of 150ms for each frame to be received.
-            # A condition variable is used to synchronize the access to the renderer;
-            # it will be notified by the user defined frame available callback thread.
-            with renderer.frame_condition:
-                if renderer.frame_condition.wait(150.0 / 1000.0):
-                    img = renderer.frame.data
+    def signal_handler(sig, frame):
+        nonlocal keep_running
+        if not keep_running:
+            # Second Ctrl+C — force exit immediately
+            log.info("Force exit.")
+            os._exit(1)
+        log.info("Shutting down... (Ctrl+C again to force)")
+        keep_running = False
 
-                    # Resize the rendering window.
-                    if renderer.first_frame:
-                        (height, width, _) = img.shape
-                        cv2.resizeWindow(window_name, width * 2, height * 2)
-                        renderer.first_frame = False
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-                    # Render the image to the window.
-                    cv2.imshow(window_name, img)
+    manager = SeekCameraManager(SeekCameraIOType.USB)
+    renderer = Renderer()
+    manager.register_event_callback(on_event, renderer)
 
-            # Process key events.
-            key = cv2.waitKey(1)
-            if key == ord("q"):
-                break
+    while keep_running:
+        with renderer.frame_condition:
+            if renderer.frame_condition.wait(150.0 / 1000.0):
+                img = renderer.frame.data
 
-            # Check if the window has been closed manually.
+                if renderer.first_frame:
+                    (height, width, _) = img.shape
+                    cv2.resizeWindow(window_name, width * 2, height * 2)
+                    renderer.first_frame = False
+
+                cv2.imshow(window_name, img)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+        elif key == ord("f") and renderer.camera is not None:
+            log.info("Storing flat scene correction (FSC)...")
+            try:
+                renderer.camera.store_flat_scene_correction(
+                    SeekCameraFlatSceneCorrectionID.ID_0
+                )
+                log.info("FSC stored successfully.")
+            except Exception as e:
+                log.info("FSC store failed: {}".format(e))
+        elif key == ord("d") and renderer.camera is not None:
+            log.info("Deleting flat scene correction...")
+            try:
+                renderer.camera.capture_session_stop()
+                renderer.camera.delete_flat_scene_correction(
+                    SeekCameraFlatSceneCorrectionID.ID_0
+                )
+                log.info("FSC deleted.")
+                renderer.camera.capture_session_start(SeekCameraFrameFormat.COLOR_ARGB8888)
+            except Exception as e:
+                log.info("FSC delete failed: {}".format(e))
+
+        try:
             if not cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE):
                 break
+        except cv2.error:
+            break
 
-    cv2.destroyWindow(window_name)
+    # Attempt clean shutdown with a timeout — force exit if it hangs.
+    cv2.destroyAllWindows()
+    log.info("Cleaning up camera...")
+
+    def cleanup():
+        try:
+            if renderer.camera is not None and renderer.busy:
+                renderer.camera.capture_session_stop()
+        except Exception:
+            pass
+        try:
+            manager.destroy()
+        except Exception:
+            pass
+        shutdown_event.set()
+
+    cleanup_thread = Thread(target=cleanup, daemon=True)
+    cleanup_thread.start()
+    cleanup_thread.join(timeout=10)
+
+    if cleanup_thread.is_alive():
+        log.info("Cleanup timed out, forcing exit.")
+        os._exit(0)
+
+    log.info("Clean shutdown complete.")
 
 
 if __name__ == "__main__":
