@@ -45,6 +45,8 @@ from seekcamera import (
     SeekCameraFilter,
     SeekCameraFilterState,
     SeekCameraFlatSceneCorrectionID,
+    SeekCameraHistEQAGCGainLimitFactorMode,
+    SeekCameraHistEQAGCPlateauRedistributionMode,
     SeekCameraPipelineMode,
     SeekCamera,
     SeekFrame,
@@ -131,6 +133,30 @@ def on_event(camera, event_type, event_status, renderer):
         camera.register_frame_available_callback(on_frame, renderer)
         camera.capture_session_start(SeekCameraFrameFormat.COLOR_ARGB8888)
         log.info("Capture session started")
+
+        # AGC must be set AFTER capture session starts.
+        camera.agc_mode = SeekCameraAGCMode.HISTEQ
+        log.info("AGC mode set to HISTEQ")
+
+        # Tune HistEQ AGC (modeled after FLIR Boson defaults).
+        # Plateau: limits max % of pixels per histogram bin. Prevents noise
+        # amplification on flat scenes. FLIR defaults to 7%.
+        camera.histeq_agc_plateau = 0.07
+        # Redistribute clipped pixels among active bins for better contrast.
+        camera.histeq_agc_plateau_redistribution_mode = (
+            SeekCameraHistEQAGCPlateauRedistributionMode.ACTIVE_BINS_ONLY
+        )
+        # Gain limit: caps max contrast gain. FLIR defaults to 1.38.
+        camera.histeq_agc_gain_limit = 1.5
+        camera.histeq_agc_gain_limit_factor_mode = (
+            SeekCameraHistEQAGCGainLimitFactorMode.AUTO
+        )
+        # Trim histogram tails to exclude outlier pixels.
+        camera.histeq_agc_trim_left = 0.005
+        camera.histeq_agc_trim_right = 0.005
+        # Temporal smoothing to reduce frame-to-frame flicker.
+        camera.histeq_agc_alpha_time = 1.0
+        log.info("HistEQ AGC tuned: plateau=0.07, gain_limit=1.5, trim=0.5%")
 
     elif event_type == SeekCameraManagerEvent.DISCONNECT:
         # Check that the camera disconnecting is one actually associated with
